@@ -436,7 +436,7 @@ __global__ void compute_forces_kernel(float* x, float *y, float *vx, float *vy, 
 
 
 
-__global__ void update_kernel(float *x, float *y, float *vx, float *vy, float *ax, float *ay, int n, float dt, float d{
+__global__ void update_kernel(float *x, float *y, float *vx, float *vy, float *ax, float *ay, int n, float dt, float d){
 	int bodyIndex = threadIdx.x + blockIdx.x*blockDim.x;
 	int stride = blockDim.x*gridDim.x;
 	int offset = 0;
