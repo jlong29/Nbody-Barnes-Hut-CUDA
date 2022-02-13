@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include "debug.h"
 #include "kernels.cuh"
+#include <math_constants.h>
 
 __device__ const int blockSize = 256;
 __device__ const int warp = 32;
@@ -51,15 +52,15 @@ __global__ void reset_arrays_kernel(int *mutex, float *x, float *y, float *mass,
 	if(bodyIndex == 0){
 		*mutex = 0;
 		*index = n;
-		*left = 0;
-		*right = 0;
-		*bottom = 0;
-		*top = 0;
+		*left = CUDART_INF_F;
+		*right = -CUDART_INF_F;
+		*bottom = CUDART_INF_F;
+		*top = -CUDART_INF_F;
 	}
 }
 
   
-__global__ void compute_bounding_box_kernel(int *mutex, float *x, float *y, float *left, float *right, float *bottom, float *top, int n)
+__global__ void compute_bounding_box_kernel(int *mutex, float *x, float *y, volatile float *left, volatile float *right, volatile float *bottom, volatile float *top, int n)
 {
 	int index = threadIdx.x + blockDim.x*blockIdx.x;
 	int stride = blockDim.x*gridDim.x;
@@ -90,18 +91,34 @@ __global__ void compute_bounding_box_kernel(int *mutex, float *x, float *y, floa
 
 	__syncthreads();
 
+	//////////////////////////
+	// BLOCK-WISE REDUCTION //
+	//////////////////////////
+
+	// NOTE: This could be done by warps
+
 	// assumes blockDim.x is a power of 2!
 	int i = blockDim.x/2;
 	while(i != 0){
 		if(threadIdx.x < i){
-			left_cache[threadIdx.x] = fminf(left_cache[threadIdx.x], left_cache[threadIdx.x + i]);
-			right_cache[threadIdx.x] = fmaxf(right_cache[threadIdx.x], right_cache[threadIdx.x + i]);
+			left_cache[threadIdx.x]   = fminf(left_cache[threadIdx.x], left_cache[threadIdx.x + i]);
+			right_cache[threadIdx.x]  = fmaxf(right_cache[threadIdx.x], right_cache[threadIdx.x + i]);
 			bottom_cache[threadIdx.x] = fminf(bottom_cache[threadIdx.x], bottom_cache[threadIdx.x + i]);
-			top_cache[threadIdx.x] = fmaxf(top_cache[threadIdx.x], top_cache[threadIdx.x + i]);
+			top_cache[threadIdx.x]    = fmaxf(top_cache[threadIdx.x], top_cache[threadIdx.x + i]);
 		}
 		__syncthreads();
 		i /= 2;
 	}
+
+	/////////////////////
+	// FINAL REDUCTION //
+	/////////////////////
+
+	//NOTE: threadIdx.x == 0 in each block performs final reduction using atomics
+
+	// How the lock works
+	// -If a thread has the lock, the mutex will be 1, and the thread loops (spin lock)
+	// -If a thread does not have the lock, it takes the lock and is done
 
 	if(threadIdx.x == 0){
 		while (atomicCAS(mutex, 0 ,1) != 0); // lock
@@ -114,8 +131,17 @@ __global__ void compute_bounding_box_kernel(int *mutex, float *x, float *y, floa
 }
 
 
-__global__ void build_tree_kernel(float *x, float *y, float *mass, int *count, int *start, int *child, int *index, float *left, float *right, float *bottom, float *top, int n, int m)
+__global__ void build_tree_kernel(volatile float *x, volatile float *y, volatile float *mass, volatile int *count,
+									int *start, volatile int *child, int *index,
+									const float *left, const float *right, const float *bottom, const float *top,
+									const int n, const int m)
 {
+	/*
+	index:	a global index start at n
+	n:		the number of bodies
+	m:		the number of possible nodes
+	*/
+
 	int bodyIndex = threadIdx.x + blockIdx.x*blockDim.x;
 	int stride = blockDim.x*gridDim.x;
 	int offset = 0;
@@ -133,12 +159,14 @@ __global__ void build_tree_kernel(float *x, float *y, float *mass, int *count, i
 
 		if(newBody){
 			newBody = false;
+			//Top/Down Traversal: All particles start in one of the top 4 quads
 
 			l = *left;
 			r = *right;
 			b = *bottom;
 			t = *top;
 
+			//Check body location within the top 4 nodes
 			temp = 0;
 			childPath = 0;
 			if(x[bodyIndex + offset] < 0.5*(l+r)){
@@ -156,10 +184,16 @@ __global__ void build_tree_kernel(float *x, float *y, float *mass, int *count, i
 				b = 0.5*(t+b);
 			}
 		}
+
+		//Set childIndex, which could be after mutliple loops
 		int childIndex = child[temp*4 + childPath];
 
-		// traverse tree until we hit leaf node
+		// traverse tree until we hit leaf node (could be allocated or not)
+
+		//NOTE: childIndex >= n means we are in a cell not a leaf
+		// You could also land in an unallocated (-1) or locked (-2) node
 		while(childIndex >= n){
+			//Check body location within the 4 quads of this node
 			temp = childIndex;
 			childPath = 0;
 			if(x[bodyIndex + offset] < 0.5*(l+r)){
@@ -177,96 +211,123 @@ __global__ void build_tree_kernel(float *x, float *y, float *mass, int *count, i
 				b = 0.5*(t+b);
 			}
 
-			atomicAdd(&x[temp], mass[bodyIndex + offset]*x[bodyIndex + offset]);
-			atomicAdd(&y[temp], mass[bodyIndex + offset]*y[bodyIndex + offset]);
-			atomicAdd(&mass[temp], mass[bodyIndex + offset]);
-			atomicAdd(&count[temp], 1);
+			//Update the Centroid in this cell
+			atomicAdd((float*)&x[temp], mass[bodyIndex + offset]*x[bodyIndex + offset]);
+			atomicAdd((float*)&y[temp], mass[bodyIndex + offset]*y[bodyIndex + offset]);
+			//Increment total mass in this cell
+			atomicAdd((float*)&mass[temp], mass[bodyIndex + offset]);
+			//Increment body count within this cell
+			atomicAdd((int*)&count[temp], 1);
+
+			//Advance to child of this cell
 			childIndex = child[4*temp + childPath];
 		}
 
-
+		// Check if child is already locked i.e. childIndex == -2
 		if(childIndex != -2){
+			//Acquire lock
 			int locked = temp*4 + childPath;
-			if(atomicCAS(&child[locked], childIndex, -2) == childIndex){
+			if(atomicCAS((int*)&child[locked], childIndex, -2) == childIndex){
+				//If unallocated, insert body and unlock
 				if(childIndex == -1){
+					//The initial assignment of childIndex -1 -> body Idx
 					child[locked] = bodyIndex + offset;
 				}
 				else{
-					//int patch = 2*n;
+
+					//Sets max on number of internal nodes
 					int patch = 4*n;
 					while(childIndex >= 0 && childIndex < n){
-						
-				 		int cell = atomicAdd(index,1);
-				 		patch = min(patch, cell);
-				 		if(patch != cell){
-				 			child[4*temp + childPath] = cell;
-				 		}
 
-                     	// insert old particle
-				 		childPath = 0;
-				 		if(x[childIndex] < 0.5*(l+r)){
-				 			childPath += 1;
-                     	}
-				 		if(y[childIndex] < 0.5*(b+t)){
-				 			childPath += 2;
-				 		}
+						//NOTE: the childIndex < n should never obtain.
+						// childIndex should always be -1, unallocated, or >=0, allocated
 
-				 		if(DEBUG){
-				 			// if(cell >= 2*n){
-				 			if(cell >= m){
-				 				printf("%s\n", "error cell index is too large!!");
-				 				printf("cell: %d\n", cell);
-				 			}
-				 		}
-				 		x[cell] += mass[childIndex]*x[childIndex];
-				 		y[cell] += mass[childIndex]*y[childIndex];
-				 		mass[cell] += mass[childIndex];
-				 		count[cell] += count[childIndex];
-				 		child[4*cell + childPath] = childIndex;
+						//Create a new cell, starting at index n
+						int cell = atomicAdd(index,1);
+						patch = min(patch, cell);	// ??? this will be patch == cell until cell >= 4*n
 
-				 		start[cell] = -1;
+						//Re-assign child from body Index to new cell index
+						if(patch != cell){
+							child[4*temp + childPath] = cell;
+						}
 
+						// insert old particle into new cell
+						childPath = 0;
+						if(x[childIndex] < 0.5*(l+r)){
+							childPath += 1;
+						}
+						if(y[childIndex] < 0.5*(b+t)){
+							childPath += 2;
+						}
 
-                     	// insert new particle
-				 		temp = cell;
-				 		childPath = 0;
-				 		if(x[bodyIndex + offset] < 0.5*(l+r)){
-				 			childPath += 1;
-				 			r = 0.5*(l+r);
-				 		}
-				 		else{
-				 			l = 0.5*(l+r);
-				 		}
-				 		if(y[bodyIndex + offset] < 0.5*(b+t)){
-				 			childPath += 2;
-				 			t = 0.5*(t+b);
-				 		}
-				 		else{
-				 			b = 0.5*(t+b);
-				 		}
-				 		x[cell] += mass[bodyIndex + offset]*x[bodyIndex + offset];
-				 		y[cell] += mass[bodyIndex + offset]*y[bodyIndex + offset];
-				 		mass[cell] += mass[bodyIndex + offset];
-				 		count[cell] += count[bodyIndex + offset];
-				 		childIndex = child[4*temp + childPath]; 
-				 	}
-				
-				 	child[4*temp + childPath] = bodyIndex + offset;
+						if(DEBUG){
+							// if(cell >= 2*n){
+							if(cell >= m){
+								printf("%s\n", "error cell index is too large!!");
+								printf("cell: %d\n", cell);
+							}
+						}
 
-				 	__threadfence();  // we have been writing to global memory arrays (child, x, y, mass) thus need to fence
+						//Update the Centroid in this new cell with old particle
+						x[cell] += mass[childIndex]*x[childIndex];
+						y[cell] += mass[childIndex]*y[childIndex];
+						//Increment total mass in this new cell with old particle
+						mass[cell] += mass[childIndex];
+						//Increments body count within this cell with old particle
+						count[cell] += count[childIndex];
+						//Re-assign old particle to subtree entry
+						child[4*cell + childPath] = childIndex;
 
-				 	child[locked] = patch;
-				}
+						start[cell] = -1;
 
-				// __threadfence(); // we have been writing to global memory arrays (child, x, y, mass) thus need to fence
+						// insert new particle
+						temp = cell;
+						childPath = 0;
+						if(x[bodyIndex + offset] < 0.5*(l+r)){
+							childPath += 1;
+							r = 0.5*(l+r);
+						}
+						else{
+							l = 0.5*(l+r);
+						}
+						if(y[bodyIndex + offset] < 0.5*(b+t)){
+							childPath += 2;
+							t = 0.5*(t+b);
+						}
+						else{
+							b = 0.5*(t+b);
+						}
+						//Update the Centroid in this new cell with new particle
+						x[cell] += mass[bodyIndex + offset]*x[bodyIndex + offset];
+						y[cell] += mass[bodyIndex + offset]*y[bodyIndex + offset];
+						//Increment total mass in this new cell with new particle
+						mass[cell] += mass[bodyIndex + offset];
+						//Increments body count within this cell with new particle
+						count[cell] += count[bodyIndex + offset];
+
+						//Set to value of child at this entry, which could be:
+						// -1 == break
+						// a body index, meaning the need to further subdivide
+						childIndex = child[4*temp + childPath]; 
+					}
+
+					//This means childIndex is set to -1, unallocated, so allocated as body Index
+					child[4*temp + childPath] = bodyIndex + offset;
+
+					__threadfence();  // Ensures all writes to global memory are complete before lock is released
+
+					//Now this locked Index is a cell
+					child[locked] = patch;
+				}	// if(childIndex == -1): first assignment to body or not
 
 				offset += stride;
 				newBody = true;
-			}
+			}	//if(atomicCAS((int*)&child[locked], childIndex, -2) == childIndex)
 
-		}
+		}	//if(childIndex != -2): locked already or not. If locked, go around again
 
-		__syncthreads(); // not strictly needed 
+		// Wait for threads in block to release locks to reduce memory pressure
+		__syncthreads(); // not strictly needed for correctness
 	}
 }
 
@@ -361,8 +422,8 @@ __global__ void compute_forces_kernel(float* x, float *y, float *vx, float *vy, 
 	while(bodyIndex + offset < n){
 		int sortedIndex = sorted[bodyIndex + offset];
 
-		float pos_x = x[sortedIndex];      
-		float pos_y = y[sortedIndex];      
+		float pos_x = x[sortedIndex];
+		float pos_y = y[sortedIndex];
 		float acc_x = 0;
 		float acc_y = 0; 
 
@@ -401,14 +462,14 @@ __global__ void compute_forces_kernel(float* x, float *y, float *vx, float *vy, 
 			
 				if(ch >= 0){
 					float dx = x[ch] - pos_x;
-  					float dy = y[ch] - pos_y;
-    				float r = dx*dx + dy*dy + eps2;
-    				if(ch < n /*is leaf node*/ || __all(dp <= r)/*meets criterion*/){ 
-    					r = rsqrt(r);
-    					float f = mass[ch] * r * r * r;
+					float dy = y[ch] - pos_y;
+					float r = dx*dx + dy*dy + eps2;
+					if(ch < n /*is leaf node*/ || __all(dp <= r)/*meets criterion*/){
+						r = rsqrt(r);
+						float f = mass[ch] * r * r * r;
 
-    					acc_x += f*dx;
-    					acc_y += f*dy;
+						acc_x += f*dx;
+						acc_y += f*dy;
 					}
 					else{
 						if(counter == 0){
@@ -425,13 +486,13 @@ __global__ void compute_forces_kernel(float* x, float *y, float *vx, float *vy, 
 			top--;
 		}
 
-		ax[sortedIndex] = acc_x;     
-   		ay[sortedIndex] = acc_y;     
+		ax[sortedIndex] = acc_x;
+		ay[sortedIndex] = acc_y;
 
-   		offset += stride;
+		offset += stride;
 
-   		__syncthreads();
-   	}
+		__syncthreads();
+	}
 }
 
 

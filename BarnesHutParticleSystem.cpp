@@ -30,7 +30,7 @@ BarnesHutParticleSystem::BarnesHutParticleSystem(const SimulationParameters p, c
 	parameters = p;
 	step = 0;
 	numParticles = n;
-	numNodes = 2*n+12000;
+	numNodes = 2*n+12000;	//Seems like a magic large function of n
 
 	// allocate host data
 	h_left = new float;

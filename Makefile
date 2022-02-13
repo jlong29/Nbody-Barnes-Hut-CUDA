@@ -4,7 +4,7 @@
 objects= main.o kernels.o BarnesHutParticleSystem.o Particle_cuda.o debug.o
 NVCC= nvcc              #cuda c compiler
 CPP= g++                 #c++ compiler
-opt= -O2 -g -G           #optimization flag
+opt= -O2 -g -G -Wno-deprecated-gpu-targets #optimization flag
 ARCH= -arch=sm_30        #cuda compute capability
 #LIBS= -lglut -lGLU -lGL  
 #LIBS= -lGLU -lGL -lGLEW -lm -lsfml-graphics -lsfml-window -lsfml-system 
@@ -29,4 +29,4 @@ main.o: main.cpp
 
 
 clean:
-	rm $(objects)
+	rm main $(objects)
